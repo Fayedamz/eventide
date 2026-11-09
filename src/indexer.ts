@@ -2,22 +2,27 @@ import { RpcClient } from './rpc.js';
 import { Store } from './db.js';
 import { decodeScVal, decodeTopics } from './decode.js';
 import type { Config, EndpointConfig, RpcEvent } from './types.js';
+
+type Fetcher = typeof fetch;
 const batches = <T>(items: T[], size: number) =>
   Array.from({ length: Math.ceil(items.length / size) }, (_, i) =>
     items.slice(i * size, (i + 1) * size),
   );
+
 export class Indexer {
   private clients = new Map<string, RpcClient>();
   constructor(
     private cfg: Config,
     private store: Store,
+    fetcher: Fetcher = fetch,
   ) {
-    for (const e of cfg.endpoints) this.clients.set(e.name, new RpcClient(e));
+    for (const endpoint of cfg.endpoints)
+      this.clients.set(endpoint.name, new RpcClient(endpoint, fetcher));
   }
   async verifyNetworks() {
-    for (const [name, c] of this.clients) {
-      const n = await c.getNetwork();
-      if (n.passphrase !== this.cfg.networkPassphrase)
+    for (const [name, client] of this.clients) {
+      const network = await client.getNetwork();
+      if (network.passphrase !== this.cfg.networkPassphrase)
         throw new Error(`Network passphrase mismatch for ${name}`);
     }
   }
@@ -26,27 +31,32 @@ export class Indexer {
     contracts: string[],
     start: number,
     end?: number,
+    initialCursor?: string,
   ) {
     const client = this.clients.get(endpoint.name)!;
-    // Stellar RPC documents a maximum of five contract IDs per filter; cursor pages omit start/end.
+    // Official getEvents semantics: startLedger is inclusive, endLedger is exclusive, and cursor pages omit both.
     const filters = [{ type: 'contract', contractIds: contracts }];
-    let cursor: string | undefined;
-    let latest = start - 1;
-    let oldest = start;
-    let pages = 0;
+    let cursor = initialCursor;
+    let coveredThrough = start - 1;
+    let chainLatest = start - 1;
+    let finished = false;
     for (;;) {
       const params = cursor
         ? { filters, pagination: { cursor, limit: this.cfg.pageLimit } }
         : {
             startLedger: start,
-            ...(end !== undefined ? { endLedger: end + 1 } : {}),
+            ...(end === undefined ? {} : { endLedger: end + 1 }),
             filters,
             pagination: { limit: this.cfg.pageLimit },
           };
       const page = await client.getEvents(params);
-      pages++;
-      latest = Math.max(latest, page.latestLedger);
-      oldest = page.oldestLedger;
+      chainLatest = page.latestLedger;
+      const events = page.events.filter(
+        (event) => event.ledger >= start && (end === undefined || event.ledger <= end),
+      );
+      const lastLedger = events.length
+        ? Math.max(...events.map((event) => event.ledger))
+        : coveredThrough;
       const grouped = new Map<
         string,
         Array<{
@@ -60,65 +70,72 @@ export class Indexer {
           endpoint: string;
         }>
       >();
-      for (const event of page.events) {
-        const d = decodeScVal(event.value),
-          t = decodeTopics(event.topic);
+      for (const event of events) {
+        const value = decodeScVal(event.value);
+        const topics = decodeTopics(event.topic);
         const item = {
           event,
-          valueXdr: d.raw,
-          valueJson: d.json === null ? null : JSON.stringify(d.json),
-          topicsJson: JSON.stringify(t.raw),
-          decodedTopicsJson: JSON.stringify(t.decoded),
-          eventName: t.eventName,
-          decodeError: d.error || t.error,
+          valueXdr: value.raw,
+          valueJson: value.json === null ? null : JSON.stringify(value.json),
+          topicsJson: JSON.stringify(topics.raw),
+          decodedTopicsJson: JSON.stringify(topics.decoded),
+          eventName: topics.eventName,
+          decodeError: value.error || topics.error,
           endpoint: endpoint.name,
         };
-        const key = event.contractId ?? contracts[0];
-        if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key)!.push(item);
+        const contract = event.contractId ?? contracts[0];
+        if (!grouped.has(contract)) grouped.set(contract, []);
+        grouped.get(contract)!.push(item);
+      }
+      if (events.length) coveredThrough = Math.max(coveredThrough, lastLedger);
+      if (page.events.length === 0) {
+        finished = true;
+        if (end !== undefined) coveredThrough = end;
+      } else if (end !== undefined && lastLedger >= end) {
+        finished = true;
+        coveredThrough = end;
       }
       for (const contract of contracts) {
         const items = grouped.get(contract) ?? [];
         this.store.insertPage(items, {
           contract,
-          cursor: page.cursor,
-          latestLedger: page.latestLedger,
+          cursor: finished ? undefined : page.cursor,
+          coveredThrough,
+          chainLatest,
           coveredStart: start,
-          coveredEnd:
-            end !== undefined
-              ? Math.min(end, page.latestLedger)
-              : page.events.length
-                ? Math.max(...page.events.map((e) => e.ledger))
-                : page.latestLedger,
           source: endpoint.name,
         });
       }
-      if (!page.cursor || page.events.length === 0 || (end !== undefined && latest >= end)) break;
+      if (finished || !page.cursor) break;
       cursor = page.cursor;
-      if (pages > 100000) throw new Error('pagination safety limit exceeded');
     }
-    return { latest, oldest };
+    return { coveredThrough, chainLatest };
   }
   async pollEndpoint(endpoint: EndpointConfig, contracts = endpoint.contracts) {
-    const health = await this.clients.get(endpoint.name)!.getHealth();
+    const client = this.clients.get(endpoint.name)!;
+    const health = await client.getHealth();
     for (const group of batches(contracts, 5)) {
-      const starts = group.map(
-        (c) => this.store.checkpoint(c)?.latest_ledger ?? health.oldestLedger,
-      );
-      const start = Math.min(...starts);
-      if (start < health.oldestLedger) {
-        for (const c of group)
-          this.store.addGap({
-            contract: c,
-            startLedger: starts[group.indexOf(c)],
-            endLedger: health.oldestLedger - 1,
-            reason: 'RPC retention window no longer includes requested start',
-            status: 'open',
-          });
-        await this.fetchRange(endpoint, group, health.oldestLedger);
-        continue;
+      if (group.length === 1) {
+        const checkpoint = this.store.checkpoint(group[0]);
+        const start = checkpoint ? checkpoint.covered_through + 1 : health.oldestLedger;
+        await this.fetchRange(endpoint, group, start, undefined, checkpoint?.cursor ?? undefined);
+      } else {
+        const starts = group.map(
+          (contract) => this.store.checkpoint(contract)?.covered_through ?? health.oldestLedger,
+        );
+        const start = Math.min(...starts);
+        if (start < health.oldestLedger) {
+          for (const contract of group)
+            this.store.addGap({
+              contract,
+              startLedger: starts[group.indexOf(contract)],
+              endLedger: health.oldestLedger - 1,
+              reason: 'RPC retention window no longer includes requested start',
+              status: 'open',
+            });
+          await this.fetchRange(endpoint, group, health.oldestLedger);
+        } else await this.fetchRange(endpoint, group, start);
       }
-      await this.fetchRange(endpoint, group, start);
     }
   }
   async runOnce() {
@@ -133,30 +150,31 @@ export class Indexer {
   }
   async backfill() {
     await this.verifyNetworks();
-    for (const gap of this.store.gaps().filter((g) => g.status === 'open')) {
+    for (const gap of this.store.gaps().filter((item) => item.status === 'open')) {
       let recovered = false;
       for (const endpoint of this.cfg.endpoints.filter(
-        (e) => e.archiveCapable && e.contracts.includes(gap.contract),
+        (item) => item.archiveCapable && item.contracts.includes(gap.contract),
       )) {
         try {
           await this.fetchRange(endpoint, [gap.contract], gap.startLedger, gap.endLedger);
-          const covered = this.store
+          recovered = this.store
             .coverage(gap.contract)
-            .some((i) => i.start_ledger <= gap.startLedger && i.end_ledger >= gap.endLedger);
-          if (covered) {
-            recovered = true;
-            break;
-          }
+            .some(
+              (interval) =>
+                interval.start_ledger <= gap.startLedger && interval.end_ledger >= gap.endLedger,
+            );
+          if (recovered) break;
         } catch (error) {
           console.error(`backfill ${endpoint.name}: ${String(error)}`);
         }
       }
-      if (recovered && gap.id) this.store.updateGap(gap.id, 'recovered');
-      else if (gap.id)
+      if (gap.id)
         this.store.updateGap(
           gap.id,
-          'unrecoverable',
-          'No archive-capable endpoint covered the complete requested range',
+          recovered ? 'recovered' : 'unrecoverable',
+          recovered
+            ? undefined
+            : 'No archive-capable endpoint covered the complete requested range',
         );
     }
   }
@@ -164,7 +182,7 @@ export class Indexer {
     await this.verifyNetworks();
     while (!signal?.aborted) {
       await this.runOnce();
-      await new Promise((r) => setTimeout(r, this.cfg.pollIntervalMs));
+      await new Promise((resolve) => setTimeout(resolve, this.cfg.pollIntervalMs));
     }
   }
 }

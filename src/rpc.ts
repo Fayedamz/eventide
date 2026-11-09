@@ -1,16 +1,29 @@
 import { resolveEndpoint } from './config.js';
 import { redact } from './redact.js';
 import type { EndpointConfig, EventsResult } from './types.js';
+
 export class RpcError extends Error {
   constructor(
     public code: number | undefined,
     message: string,
     public status?: number,
+    public retryAfter?: string | null,
   ) {
     super(message);
   }
 }
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const retryDelay = (attempt: number, retryAfter?: string | null) => {
+  const seconds = retryAfter ? Number(retryAfter) : NaN;
+  return Number.isFinite(seconds) && seconds >= 0
+    ? seconds * 1000
+    : Math.min(5000, 250 * 2 ** attempt) + Math.floor(Math.random() * 100);
+};
+const retryable = (error: unknown) => {
+  if (!(error instanceof RpcError)) return true;
+  return error.status === 429 || (error.status !== undefined && error.status >= 500);
+};
+
 export class RpcClient {
   constructor(
     public endpoint: EndpointConfig,
@@ -21,43 +34,47 @@ export class RpcClient {
     const timeout = this.endpoint.timeoutMs ?? 10000;
     for (let attempt = 0; ; attempt++) {
       const target = resolveEndpoint(this.endpoint);
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), timeout);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
       try {
-        const res = await this.fetchImpl(target.url, {
+        const response = await this.fetchImpl(target.url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...target.headers },
           body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
-          signal: ctl.signal,
+          signal: controller.signal,
         });
-        clearTimeout(timer);
-        const text = await res.text();
+        const text = await response.text();
         let body: { result?: T; error?: { code?: number; message?: string } };
         try {
           body = JSON.parse(text);
         } catch {
-          throw new RpcError(undefined, `RPC returned non-JSON (HTTP ${res.status})`, res.status);
-        }
-        if ((res.status === 429 || res.status >= 500) && attempt < max) {
-          const retryAfter = Number(res.headers.get('retry-after') ?? 0) * 1000;
-          await sleep(
-            retryAfter || Math.min(5000, 250 * 2 ** attempt) + Math.floor(Math.random() * 100),
-          );
-          continue;
-        }
-        if (!res.ok || body.error)
           throw new RpcError(
-            body.error?.code,
-            redact(body.error?.message ?? `HTTP ${res.status}`),
-            res.status,
+            undefined,
+            `RPC returned non-JSON (HTTP ${response.status})`,
+            response.status,
+          );
+        }
+        if (body.error)
+          throw new RpcError(
+            body.error.code,
+            redact(body.error.message ?? 'RPC application error'),
+          );
+        if (!response.ok)
+          throw new RpcError(
+            undefined,
+            redact(`HTTP ${response.status}`),
+            response.status,
+            response.headers.get('retry-after'),
           );
         return body.result as T;
       } catch (error) {
+        if (attempt >= max || !retryable(error)) {
+          if (error instanceof RpcError) throw error;
+          throw new RpcError(undefined, redact(error));
+        }
+        await sleep(retryDelay(attempt, error instanceof RpcError ? error.retryAfter : undefined));
+      } finally {
         clearTimeout(timer);
-        if (error instanceof RpcError && error.status === 429) throw error;
-        if (attempt >= max)
-          throw new RpcError(error instanceof RpcError ? error.code : undefined, redact(error));
-        await sleep(Math.min(5000, 250 * 2 ** attempt) + Math.floor(Math.random() * 100));
       }
     }
   }
@@ -76,8 +93,10 @@ export class RpcClient {
     return this.call<EventsResult>('getEvents', params);
   }
 }
-export function isBeforeOldest(e: unknown) {
+export function isBeforeOldest(error: unknown) {
   return (
-    e instanceof RpcError && e.code === -32600 && /start is before oldest ledger/i.test(e.message)
+    error instanceof RpcError &&
+    error.code === -32600 &&
+    /start is before oldest ledger/i.test(error.message)
   );
 }

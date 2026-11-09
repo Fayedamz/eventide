@@ -188,6 +188,20 @@ describe('decoding and transport', () => {
     await expect(c.getNetwork()).rejects.toThrow('bad params');
     expect(calls).toBe(1);
   });
+  it('honors Retry-After for a transient 429 response', async () => {
+    let calls = 0;
+    const c = new RpcClient(
+      { name: 'm', url: 'https://x.test', archiveCapable: false, contracts: [], maxRetries: 1 },
+      async () => {
+        calls++;
+        return calls === 1
+          ? new Response('', { status: 429, headers: { 'retry-after': '0' } })
+          : new Response(JSON.stringify({ result: { passphrase: 'test' } }));
+      },
+    );
+    await expect(c.getNetwork()).resolves.toEqual({ passphrase: 'test' });
+    expect(calls).toBe(2);
+  });
 });
 describe('api', () => {
   it('rejects bad pagination and reports per-query completeness', async () => {
@@ -231,10 +245,32 @@ describe('api', () => {
     expect((await app.inject('/health')).statusCode).toBe(200);
     expect((await app.inject('/status')).statusCode).toBe(401);
     expect(
-      (await app.inject('/status', { headers: { authorization: 'Bearer secret' } })).statusCode,
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/status',
+          headers: { authorization: 'Bearer secret' },
+        })
+      ).statusCode,
     ).toBe(200);
     await app.close();
     s.close();
     delete process.env.EVENTIDE_TEST_KEY;
+  });
+  it('refuses to create an API when the configured key is empty', () => {
+    delete process.env.EVENTIDE_EMPTY_KEY;
+    const s = store();
+    expect(() =>
+      createApi(s, {
+        networkPassphrase: 'p',
+        database: 'x',
+        pollIntervalMs: 1,
+        pageLimit: 1,
+        retry: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 1 },
+        endpoints: [],
+        api: { host: '127.0.0.1', port: 1, corsOrigins: [], apiKeyEnv: 'EVENTIDE_EMPTY_KEY' },
+      }),
+    ).toThrow(/unset or empty/);
+    s.close();
   });
 });
