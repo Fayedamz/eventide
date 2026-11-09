@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed retention-gap detection for single-contract polling.
+
 ## 0.3.0 - 2026-11-09
 
 - Fixed contract StrKey validation to accept C... contract IDs and reject G... account addresses.

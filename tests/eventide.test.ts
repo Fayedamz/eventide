@@ -154,6 +154,145 @@ describe('indexer pagination', () => {
     expect(s.coverage(contract)[0]).toMatchObject({ start_ledger: 10, end_ledger: 12 });
     s.close();
   });
+  const seedCheckpoint = (s: Store, id: string, through: number, cursor: string | null) =>
+    s.insertPage([], {
+      contract: id,
+      cursor: cursor ?? undefined,
+      coveredThrough: through,
+      chainLatest: through,
+      coveredStart: through,
+    });
+  const emptyEvents = () =>
+    new Response(JSON.stringify({ result: { events: [], latestLedger: 100, oldestLedger: 10 } }));
+  it('records a single-contract retention gap and never sends its stale cursor', async () => {
+    const s = store();
+    seedCheckpoint(s, contract, 4, 'stale-cursor');
+    const requests: Array<Record<string, any>> = [];
+    const fetchImpl = async (_url: string, options?: RequestInit) => {
+      const body = JSON.parse(String(options?.body));
+      requests.push({ method: body.method, params: body.params });
+      if (body.method === 'getHealth')
+        return new Response(JSON.stringify({ result: { oldestLedger: 10, latestLedger: 100 } }));
+      return emptyEvents();
+    };
+    await new Indexer(config('http://archive'), s, fetchImpl).pollEndpoint({
+      name: 'archive',
+      url: 'http://archive',
+      archiveCapable: true,
+      contracts: [contract],
+      maxRetries: 0,
+    });
+    expect(s.gaps()).toMatchObject([{ contract, startLedger: 5, endLedger: 9, status: 'open' }]);
+    const params = requests.find((request) => request.method === 'getEvents')!.params;
+    expect(params.startLedger).toBe(10);
+    expect(params.pagination.cursor).toBeUndefined();
+    s.close();
+  });
+  it('uses covered-through plus one per contract in a multi-contract group', async () => {
+    const s = store();
+    const second = 'C2';
+    seedCheckpoint(s, contract, 4, 'old-1');
+    seedCheckpoint(s, second, 7, 'old-2');
+    const requests: Array<Record<string, any>> = [];
+    const fetchImpl = async (_url: string, options?: RequestInit) => {
+      const body = JSON.parse(String(options?.body));
+      requests.push({ method: body.method, params: body.params });
+      if (body.method === 'getHealth')
+        return new Response(JSON.stringify({ result: { oldestLedger: 10, latestLedger: 100 } }));
+      return emptyEvents();
+    };
+    const endpoint = {
+      name: 'archive',
+      url: 'http://archive',
+      archiveCapable: true,
+      contracts: [contract, second],
+      maxRetries: 0,
+    };
+    await new Indexer(
+      { ...config('http://archive'), endpoints: [endpoint] },
+      s,
+      fetchImpl,
+    ).pollEndpoint(endpoint);
+    expect(s.gaps()).toMatchObject([
+      { contract: second, startLedger: 8, endLedger: 9, status: 'open' },
+      { contract, startLedger: 5, endLedger: 9, status: 'open' },
+    ]);
+    expect(
+      requests
+        .filter((request) => request.method === 'getEvents')
+        .map((request) => request.params.startLedger),
+    ).toEqual([10]);
+    expect(
+      requests
+        .filter((request) => request.method === 'getEvents')
+        .every((request) => !request.params.pagination.cursor),
+    ).toBe(true);
+    s.close();
+  });
+  it('refreshes health and retries once when retention moves after health check', async () => {
+    const s = store();
+    seedCheckpoint(s, contract, 9, null);
+    let healthCalls = 0;
+    const starts: number[] = [];
+    const fetchImpl = async (_url: string, options?: RequestInit) => {
+      const body = JSON.parse(String(options?.body));
+      if (body.method === 'getHealth') {
+        healthCalls++;
+        return new Response(
+          JSON.stringify({
+            result: { oldestLedger: healthCalls === 1 ? 10 : 12, latestLedger: 100 },
+          }),
+        );
+      }
+      starts.push(body.params.startLedger);
+      if (starts.length === 1)
+        return new Response(
+          JSON.stringify({ error: { code: -32600, message: 'start is before oldest ledger' } }),
+        );
+      return new Response(
+        JSON.stringify({ result: { events: [], latestLedger: 100, oldestLedger: 12 } }),
+      );
+    };
+    await new Indexer(config('http://archive'), s, fetchImpl).pollEndpoint({
+      name: 'archive',
+      url: 'http://archive',
+      archiveCapable: true,
+      contracts: [contract],
+      maxRetries: 0,
+    });
+    expect(starts).toEqual([10, 12]);
+    expect(healthCalls).toBe(2);
+    expect(s.gaps()).toMatchObject([{ contract, startLedger: 10, endLedger: 11, status: 'open' }]);
+    s.close();
+  });
+  it('does not record a gap inside the window or for a contract without a checkpoint', async () => {
+    const s = store();
+    seedCheckpoint(s, contract, 12, null);
+    const fresh = 'C2';
+    const starts: number[] = [];
+    const fetchImpl = async (_url: string, options?: RequestInit) => {
+      const body = JSON.parse(String(options?.body));
+      if (body.method === 'getHealth')
+        return new Response(JSON.stringify({ result: { oldestLedger: 10, latestLedger: 100 } }));
+      starts.push(body.params.startLedger);
+      return emptyEvents();
+    };
+    const endpoint = {
+      name: 'archive',
+      url: 'http://archive',
+      archiveCapable: true,
+      contracts: [contract, fresh],
+      maxRetries: 0,
+    };
+    await new Indexer(
+      { ...config('http://archive'), endpoints: [endpoint] },
+      s,
+      fetchImpl,
+    ).pollEndpoint(endpoint);
+    expect(s.gaps()).toEqual([]);
+    expect(starts).toEqual([13, 10]);
+    s.close();
+  });
 });
 describe('decoding and transport', () => {
   it('decodes topics and derives the event name', () => {
