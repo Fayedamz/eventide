@@ -8,6 +8,7 @@ import { redact } from '../src/redact.js';
 import { RpcClient, RpcError, isBeforeOldest } from '../src/rpc.js';
 import { createApi } from '../src/api.js';
 import { loadConfig } from '../src/config.js';
+import { Indexer } from '../src/indexer.js';
 const files: string[] = [];
 function store() {
   const f = path.join(os.tmpdir(), `eventide-${Date.now()}-${Math.random()}.db`);
@@ -86,6 +87,73 @@ describe('configuration', () => {
     );
     expect(() => loadConfig(file)).toThrow(/invalid contract/i);
     fs.rmSync(file);
+  });
+});
+describe('indexer pagination', () => {
+  const contract = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+  const config = (url: string) => ({
+    networkPassphrase: 'test',
+    database: 'unused',
+    pollIntervalMs: 250,
+    pageLimit: 2,
+    retry: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 1 },
+    api: { host: '127.0.0.1', port: 1, corsOrigins: [] },
+    endpoints: [
+      { name: 'archive', url, archiveCapable: true, contracts: [contract], maxRetries: 0 },
+    ],
+  });
+  it('does not recover a bounded gap until all pages are fetched', async () => {
+    const s = store();
+    s.addGap({ contract, startLedger: 10, endLedger: 12, reason: 'retention', status: 'open' });
+    const calls: Array<Record<string, unknown>> = [];
+    const fetchImpl = async (_url: string, options?: RequestInit) => {
+      const body = JSON.parse(String(options?.body)) as {
+        method: string;
+        params: Record<string, any>;
+      };
+      calls.push(body.params);
+      if (body.method === 'getNetwork')
+        return new Response(JSON.stringify({ result: { passphrase: 'test' } }));
+      if (body.method === 'getHealth')
+        return new Response(
+          JSON.stringify({
+            result: { oldestLedger: 1, latestLedger: 100, ledgerRetentionWindow: 100 },
+          }),
+        );
+      const page = calls.filter((p) => p.pagination?.cursor === 'cursor-1').length;
+      if (!body.params.pagination?.cursor)
+        return new Response(
+          JSON.stringify({
+            result: {
+              events: [event('e10', 10)],
+              latestLedger: 100,
+              oldestLedger: 1,
+              cursor: 'cursor-1',
+            },
+          }),
+        );
+      if (page === 1)
+        return new Response(
+          JSON.stringify({
+            result: {
+              events: [event('e11', 11)],
+              latestLedger: 100,
+              oldestLedger: 1,
+              cursor: 'cursor-2',
+            },
+          }),
+        );
+      return new Response(
+        JSON.stringify({
+          result: { events: [event('e12', 12)], latestLedger: 100, oldestLedger: 1 },
+        }),
+      );
+    };
+    await new Indexer(config('http://archive'), s, fetchImpl).backfill();
+    expect(calls.filter((p) => p.pagination?.cursor).length).toBe(2);
+    expect(s.gaps()[0].status).toBe('recovered');
+    expect(s.coverage(contract)[0]).toMatchObject({ start_ledger: 10, end_ledger: 12 });
+    s.close();
   });
 });
 describe('decoding and transport', () => {
