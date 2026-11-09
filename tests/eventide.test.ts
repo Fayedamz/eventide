@@ -120,7 +120,6 @@ describe('indexer pagination', () => {
             result: { oldestLedger: 1, latestLedger: 100, ledgerRetentionWindow: 100 },
           }),
         );
-      const page = calls.filter((p) => p.pagination?.cursor === 'cursor-1').length;
       if (!body.params.pagination?.cursor)
         return new Response(
           JSON.stringify({
@@ -132,7 +131,7 @@ describe('indexer pagination', () => {
             },
           }),
         );
-      if (page === 1)
+      if (body.params.pagination.cursor === 'cursor-1')
         return new Response(
           JSON.stringify({
             result: {
@@ -175,6 +174,20 @@ describe('decoding and transport', () => {
     );
     await expect(c.getNetwork()).rejects.toThrow('non-JSON');
   });
+  it('does not retry JSON-RPC application errors or ordinary 4xx responses', async () => {
+    let calls = 0;
+    const c = new RpcClient(
+      { name: 'm', url: 'https://x.test', archiveCapable: false, contracts: [], maxRetries: 3 },
+      async () => {
+        calls++;
+        return new Response(JSON.stringify({ error: { code: -32602, message: 'bad params' } }), {
+          status: 200,
+        });
+      },
+    );
+    await expect(c.getNetwork()).rejects.toThrow('bad params');
+    expect(calls).toBe(1);
+  });
 });
 describe('api', () => {
   it('rejects bad pagination and reports per-query completeness', async () => {
@@ -195,5 +208,33 @@ describe('api', () => {
     expect(r.json().incomplete).toBe(true);
     await app.close();
     s.close();
+  });
+  it('exempts health and rejects missing or wrong bearer credentials', async () => {
+    process.env.EVENTIDE_TEST_KEY = 'secret';
+    const s = store();
+    const cfg = {
+      networkPassphrase: 'p',
+      database: 'x',
+      pollIntervalMs: 1,
+      pageLimit: 1,
+      retry: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 1 },
+      endpoints: [],
+      api: {
+        host: '127.0.0.1',
+        port: 1,
+        corsOrigins: [],
+        apiKeyEnv: 'EVENTIDE_TEST_KEY',
+        rateLimitPerMinute: 0,
+      },
+    };
+    const app = createApi(s, cfg);
+    expect((await app.inject('/health')).statusCode).toBe(200);
+    expect((await app.inject('/status')).statusCode).toBe(401);
+    expect(
+      (await app.inject('/status', { headers: { authorization: 'Bearer secret' } })).statusCode,
+    ).toBe(200);
+    await app.close();
+    s.close();
+    delete process.env.EVENTIDE_TEST_KEY;
   });
 });
