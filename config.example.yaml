@@ -1,0 +1,20 @@
+networkPassphrase: "Test SDF Network ; September 2015"
+database: "./eventide.db"
+pollIntervalMs: 5000
+pageLimit: 1000
+api:
+  host: "127.0.0.1"
+  port: 8787
+  cors: false
+endpoints:
+  - name: testnet
+    url: "https://soroban-testnet.stellar.org"
+    archiveCapable: false
+    contracts:
+      - "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    apiKeyEnv: "EVENTIDE_RPC_API_KEY"
+  # Only mark an endpoint archiveCapable after verifying its provider contract.
+  # - name: archive-provider
+  #   url: "https://example.invalid/rpc"
+  #   archiveCapable: true
+  #   contracts: ["C..."]

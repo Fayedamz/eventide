@@ -1,0 +1,26 @@
+{
+  "name": "eventide",
+  "version": "0.1.0",
+  "description": "Soroban event indexer that notices and repairs data gaps",
+  "type": "module",
+  "bin": { "eventide": "dist/cli.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/cli.js",
+    "test": "vitest run"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@stellar/stellar-sdk": "17.0.0",
+    "better-sqlite3": "11.10.0",
+    "fastify": "5.6.0",
+    "yaml": "2.8.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}
