@@ -33,4 +33,4 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/CONFIGURATION.md`](do
 
 ## Status
 
-Version 0.2.0 is pre-alpha and testnet-first. Reorganizations are not handled, the SQLite store is single-process, and a provider's archive capability must be explicitly verified by the operator.
+Version 0.3.0 is pre-alpha and testnet-first. Reorganizations are not handled, the SQLite store is single-process, and a provider's archive capability must be explicitly verified by the operator.
