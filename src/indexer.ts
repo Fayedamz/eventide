@@ -1,4 +1,4 @@
-import { RpcClient } from './rpc.js';
+import { isBeforeOldest, RpcClient } from './rpc.js';
 import { Store } from './db.js';
 import { decodeScVal, decodeTopics } from './decode.js';
 import type { Config, EndpointConfig, RpcEvent } from './types.js';
@@ -115,26 +115,45 @@ export class Indexer {
     const client = this.clients.get(endpoint.name)!;
     const health = await client.getHealth();
     for (const group of batches(contracts, 5)) {
-      if (group.length === 1) {
-        const checkpoint = this.store.checkpoint(group[0]);
-        const start = checkpoint ? checkpoint.covered_through + 1 : health.oldestLedger;
-        await this.fetchRange(endpoint, group, start, undefined, checkpoint?.cursor ?? undefined);
-      } else {
-        const starts = group.map(
-          (contract) => this.store.checkpoint(contract)?.covered_through ?? health.oldestLedger,
-        );
-        const start = Math.min(...starts);
-        if (start < health.oldestLedger) {
-          for (const contract of group)
+      const starts = new Map<string, number>();
+      for (const contract of group) {
+        const checkpoint = this.store.checkpoint(contract);
+        const next = checkpoint ? checkpoint.covered_through + 1 : health.oldestLedger;
+        if (next < health.oldestLedger) {
+          this.store.addGap({
+            contract,
+            startLedger: next,
+            endLedger: health.oldestLedger - 1,
+            reason: 'RPC retention window no longer includes requested start',
+            status: 'open',
+          });
+          this.store.clearCheckpointCursor(contract);
+          starts.set(contract, health.oldestLedger);
+        } else starts.set(contract, next);
+      }
+      const byStart = new Map<number, string[]>();
+      for (const [contract, start] of starts) {
+        if (!byStart.has(start)) byStart.set(start, []);
+        byStart.get(start)!.push(contract);
+      }
+      for (const [start, batch] of byStart) {
+        try {
+          await this.fetchRange(endpoint, batch, start);
+        } catch (error) {
+          if (!isBeforeOldest(error)) throw error;
+          const refreshed = await client.getHealth();
+          for (const contract of batch) {
             this.store.addGap({
               contract,
-              startLedger: starts[group.indexOf(contract)],
-              endLedger: health.oldestLedger - 1,
+              startLedger: start,
+              endLedger: refreshed.oldestLedger - 1,
               reason: 'RPC retention window no longer includes requested start',
               status: 'open',
             });
-          await this.fetchRange(endpoint, group, health.oldestLedger);
-        } else await this.fetchRange(endpoint, group, start);
+            this.store.clearCheckpointCursor(contract);
+          }
+          await this.fetchRange(endpoint, batch, refreshed.oldestLedger);
+        }
       }
     }
   }

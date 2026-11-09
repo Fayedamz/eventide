@@ -182,6 +182,9 @@ export class Store {
       | { cursor: string | null; covered_through: number; chain_latest: number }
       | undefined;
   }
+  clearCheckpointCursor(contract: string) {
+    this.db.prepare('UPDATE checkpoints SET cursor=NULL WHERE contract_id=?').run(contract);
+  }
   coverage(contract?: string) {
     return (
       contract
