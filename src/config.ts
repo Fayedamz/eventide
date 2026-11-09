@@ -37,8 +37,7 @@ export function loadConfig(file = 'eventide.yaml'): Config {
     if (e.auth?.mode === 'urlTemplate' && !e.auth.urlTemplate)
       throw new Error(`urlTemplate auth requires urlTemplate on ${e.name}`);
     for (const id of e.contracts) {
-      if (!StrKey.isValidEd25519PublicKey(id))
-        throw new Error(`invalid contract ID on ${e.name}: ${id}`);
+      if (!StrKey.isValidContract(id)) throw new Error(`invalid contract ID on ${e.name}: ${id}`);
     }
   }
   return cfg;
