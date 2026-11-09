@@ -1,0 +1,2 @@
+export function redact(input: unknown): string { const s = input instanceof Error ? `${input.name}: ${input.message}\n${input.stack ?? ''}` : String(input); return s.replace(/(https?:\/\/[^\s/?#]+)([^\s]*)/gi, (_m, host: string, tail: string) => { const clean = tail.replace(/([?&](?:api[_-]?key|token|key|secret|auth)=)[^&\s]*/gi, '$1[REDACTED]'); return `${host}${clean}`; }).replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED]'); }
+export function safeError(e: unknown): Error { return new Error(redact(e)); }

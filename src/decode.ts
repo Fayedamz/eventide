@@ -1,0 +1,2 @@
+import { xdr } from '@stellar/stellar-sdk';
+export function decodeScVal(value: string | {xdr?:string} | undefined): {xdr:string; json:string|null; error:boolean} { const raw=typeof value==='string'?value:value?.xdr; if(!raw) return {xdr:'',json:null,error:true}; try { const val=xdr.ScVal.fromXdr(Buffer.from(raw,'base64')); return {xdr:raw,json:JSON.stringify(val.toJSON()) ,error:false}; } catch { return {xdr:raw,json:null,error:true}; } }
