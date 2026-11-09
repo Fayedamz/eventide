@@ -7,6 +7,7 @@ import { decodeScVal, decodeTopics } from '../src/decode.js';
 import { redact } from '../src/redact.js';
 import { RpcClient, RpcError, isBeforeOldest } from '../src/rpc.js';
 import { createApi } from '../src/api.js';
+import { loadConfig } from '../src/config.js';
 const files: string[] = [];
 function store() {
   const f = path.join(os.tmpdir(), `eventide-${Date.now()}-${Math.random()}.db`);
@@ -67,6 +68,24 @@ describe('storage and coverage', () => {
     s.updateGap(s.gaps()[0].id!, 'unrecoverable');
     expect(s.gaps()[0].status).toBe('unrecoverable');
     s.close();
+  });
+});
+describe('configuration', () => {
+  it('accepts a contract StrKey and rejects an account StrKey', () => {
+    const file = path.join(os.tmpdir(), `eventide-config-${Date.now()}.yaml`);
+    const contract = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+    const account = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+    fs.writeFileSync(
+      file,
+      `networkPassphrase: test\ndatabase: ./test.db\nendpoints:\n  - name: mock\n    url: http://127.0.0.1\n    archiveCapable: false\n    contracts: [${contract}]\n`,
+    );
+    expect(loadConfig(file).endpoints[0].contracts).toEqual([contract]);
+    fs.writeFileSync(
+      file,
+      `networkPassphrase: test\ndatabase: ./test.db\nendpoints:\n  - name: mock\n    url: http://127.0.0.1\n    archiveCapable: false\n    contracts: [${account}]\n`,
+    );
+    expect(() => loadConfig(file)).toThrow(/invalid contract/i);
+    fs.rmSync(file);
   });
 });
 describe('decoding and transport', () => {
