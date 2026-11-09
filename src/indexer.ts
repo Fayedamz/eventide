@@ -1,9 +1,170 @@
-import { RpcClient, isBeforeOldest } from './rpc.js'; import { Store } from './db.js'; import { decodeScVal } from './decode.js'; import type { Config, EndpointConfig, RpcEvent } from './types.js';
-function chunks<T>(a:T[],n:number){const r:T[][]=[];for(let i=0;i<a.length;i+=n)r.push(a.slice(i,i+n));return r;}
-export class Indexer { stopped=false; constructor(private cfg:Config, private store:Store, private clients=cfg.endpoints.map(e=>new RpcClient(e))) {}
- async verifyNetworks(){ for(const c of this.clients){const n=await c.getNetwork(); if(n.passphrase!==this.cfg.networkPassphrase) throw new Error(`Network passphrase mismatch for ${c.endpoint.name}: expected ${this.cfg.networkPassphrase}, got ${n.passphrase}`);} }
- async pollOnce(endpoint:EndpointConfig, contract:string){const c=new RpcClient(endpoint); const cp=this.store.checkpoint(contract); let start=cp?.covered_end ? cp.covered_end+1 : undefined; let cursor=cp?.cursor ?? undefined; const health=await c.getHealth(); if(start===undefined) start=health.oldestLedger; if(start<health.oldestLedger){ this.store.addGap({contract,startLedger:start,endLedger:health.oldestLedger-1,reason:'RPC retention window no longer includes requested start',status:'open'}); return; } const filters=[{type:'contract',contractIds:[contract]}]; // The verified RPC reference caps filters and contract IDs at five; one contract per poll is safe.
- let page=await c.getEvents({...(cursor?{pagination:{cursor,limit:this.cfg.pageLimit}}:{startLedger:start,filters,pagination:{limit:this.cfg.pageLimit}})}); for(;;){const items=page.events.map((event:RpcEvent)=>{const d=decodeScVal(event.value);return {event,valueXdr:d.xdr,valueJson:d.json,decodeError:d.error,endpoint:endpoint.name};}); const max=page.events.reduce((m,e)=>Math.max(m,e.ledger),start-1); this.store.insertEvents(items,{contract,cursor:page.cursor,start,end:Math.max(max,start-1)}); if(!page.cursor || page.events.length===0) break; page=await c.getEvents({pagination:{cursor:page.cursor,limit:this.cfg.pageLimit},filters}); } }
- async runOnce(){ await this.verifyNetworks(); for(const e of this.cfg.endpoints.filter(x=>x.contracts.length)) for(const contract of e.contracts){try{await this.pollOnce(e,contract);}catch(err){if(isBeforeOldest(err)){const h=await new RpcClient(e).getHealth();this.store.addGap({contract,startLedger:this.store.checkpoint(contract)?.covered_end??0,endLedger:h.oldestLedger-1,reason:'Requested ledger is before RPC oldest ledger',status:'open'});}else console.error(`indexer ${e.name}/${contract}: ${err}`);}} }
- async backfill(){const gaps=this.store.gaps().filter(g=>g.status==='open'); for(const g of gaps){let done=false;for(const e of this.cfg.endpoints.filter(x=>x.archiveCapable&&x.contracts.includes(g.contract))){try{await this.pollOnce(e,g.contract);done=true;break;}catch(err){console.error(`backfill ${e.name}: ${err}`);}}if(done&&g.id)this.store.recoverGap(g.id);else if(g.id)this.store.db.prepare("UPDATE gaps SET status='unrecoverable' WHERE id=?").run(g.id);}}
+import { RpcClient } from './rpc.js';
+import { Store } from './db.js';
+import { decodeScVal, decodeTopics } from './decode.js';
+import type { Config, EndpointConfig, RpcEvent } from './types.js';
+const batches = <T>(items: T[], size: number) =>
+  Array.from({ length: Math.ceil(items.length / size) }, (_, i) =>
+    items.slice(i * size, (i + 1) * size),
+  );
+export class Indexer {
+  private clients = new Map<string, RpcClient>();
+  constructor(
+    private cfg: Config,
+    private store: Store,
+  ) {
+    for (const e of cfg.endpoints) this.clients.set(e.name, new RpcClient(e));
+  }
+  async verifyNetworks() {
+    for (const [name, c] of this.clients) {
+      const n = await c.getNetwork();
+      if (n.passphrase !== this.cfg.networkPassphrase)
+        throw new Error(`Network passphrase mismatch for ${name}`);
+    }
+  }
+  private async fetchRange(
+    endpoint: EndpointConfig,
+    contracts: string[],
+    start: number,
+    end?: number,
+  ) {
+    const client = this.clients.get(endpoint.name)!;
+    // Stellar RPC documents a maximum of five contract IDs per filter; cursor pages omit start/end.
+    const filters = [{ type: 'contract', contractIds: contracts }];
+    let cursor: string | undefined;
+    let latest = start - 1;
+    let oldest = start;
+    let pages = 0;
+    for (;;) {
+      const params = cursor
+        ? { filters, pagination: { cursor, limit: this.cfg.pageLimit } }
+        : {
+            startLedger: start,
+            ...(end !== undefined ? { endLedger: end + 1 } : {}),
+            filters,
+            pagination: { limit: this.cfg.pageLimit },
+          };
+      const page = await client.getEvents(params);
+      pages++;
+      latest = Math.max(latest, page.latestLedger);
+      oldest = page.oldestLedger;
+      const grouped = new Map<
+        string,
+        Array<{
+          event: RpcEvent;
+          valueXdr: string | null;
+          valueJson: string | null;
+          topicsJson: string;
+          decodedTopicsJson: string;
+          eventName: string | null;
+          decodeError: boolean;
+          endpoint: string;
+        }>
+      >();
+      for (const event of page.events) {
+        const d = decodeScVal(event.value),
+          t = decodeTopics(event.topic);
+        const item = {
+          event,
+          valueXdr: d.raw,
+          valueJson: d.json === null ? null : JSON.stringify(d.json),
+          topicsJson: JSON.stringify(t.raw),
+          decodedTopicsJson: JSON.stringify(t.decoded),
+          eventName: t.eventName,
+          decodeError: d.error || t.error,
+          endpoint: endpoint.name,
+        };
+        const key = event.contractId ?? contracts[0];
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key)!.push(item);
+      }
+      for (const contract of contracts) {
+        const items = grouped.get(contract) ?? [];
+        this.store.insertPage(items, {
+          contract,
+          cursor: page.cursor,
+          latestLedger: page.latestLedger,
+          coveredStart: start,
+          coveredEnd:
+            end !== undefined
+              ? Math.min(end, page.latestLedger)
+              : page.events.length
+                ? Math.max(...page.events.map((e) => e.ledger))
+                : page.latestLedger,
+          source: endpoint.name,
+        });
+      }
+      if (!page.cursor || page.events.length === 0 || (end !== undefined && latest >= end)) break;
+      cursor = page.cursor;
+      if (pages > 100000) throw new Error('pagination safety limit exceeded');
+    }
+    return { latest, oldest };
+  }
+  async pollEndpoint(endpoint: EndpointConfig, contracts = endpoint.contracts) {
+    const health = await this.clients.get(endpoint.name)!.getHealth();
+    for (const group of batches(contracts, 5)) {
+      const starts = group.map(
+        (c) => this.store.checkpoint(c)?.latest_ledger ?? health.oldestLedger,
+      );
+      const start = Math.min(...starts);
+      if (start < health.oldestLedger) {
+        for (const c of group)
+          this.store.addGap({
+            contract: c,
+            startLedger: starts[group.indexOf(c)],
+            endLedger: health.oldestLedger - 1,
+            reason: 'RPC retention window no longer includes requested start',
+            status: 'open',
+          });
+        await this.fetchRange(endpoint, group, health.oldestLedger);
+        continue;
+      }
+      await this.fetchRange(endpoint, group, start);
+    }
+  }
+  async runOnce() {
+    await this.verifyNetworks();
+    for (const endpoint of this.cfg.endpoints) {
+      try {
+        await this.pollEndpoint(endpoint);
+      } catch (error) {
+        console.error(`endpoint ${endpoint.name}: ${String(error)}`);
+      }
+    }
+  }
+  async backfill() {
+    await this.verifyNetworks();
+    for (const gap of this.store.gaps().filter((g) => g.status === 'open')) {
+      let recovered = false;
+      for (const endpoint of this.cfg.endpoints.filter(
+        (e) => e.archiveCapable && e.contracts.includes(gap.contract),
+      )) {
+        try {
+          await this.fetchRange(endpoint, [gap.contract], gap.startLedger, gap.endLedger);
+          const covered = this.store
+            .coverage(gap.contract)
+            .some((i) => i.start_ledger <= gap.startLedger && i.end_ledger >= gap.endLedger);
+          if (covered) {
+            recovered = true;
+            break;
+          }
+        } catch (error) {
+          console.error(`backfill ${endpoint.name}: ${String(error)}`);
+        }
+      }
+      if (recovered && gap.id) this.store.updateGap(gap.id, 'recovered');
+      else if (gap.id)
+        this.store.updateGap(
+          gap.id,
+          'unrecoverable',
+          'No archive-capable endpoint covered the complete requested range',
+        );
+    }
+  }
+  async watch(signal?: AbortSignal) {
+    await this.verifyNetworks();
+    while (!signal?.aborted) {
+      await this.runOnce();
+      await new Promise((r) => setTimeout(r, this.cfg.pollIntervalMs));
+    }
+  }
 }

@@ -1,5 +1,112 @@
-import { describe, expect, it, afterEach } from 'vitest'; import os from 'node:os'; import path from 'node:path'; import fs from 'node:fs'; import { Store } from '../src/db.js'; import { decodeScVal } from '../src/decode.js'; import { redact } from '../src/redact.js'; import { RpcClient, isBeforeOldest, RpcError } from '../src/rpc.js'; import { createApi } from '../src/api.js';
-const files:string[]=[]; function store(){const f=path.join(os.tmpdir(),`eventide-${Date.now()}-${Math.random()}.db`);files.push(f);return new Store(f)} afterEach(()=>{for(const f of files)for(const x of [f,`${f}-wal`,`${f}-shm`])try{fs.rmSync(x)}catch{}});
-describe('Eventide storage',()=>{it('stores duplicate events once and resumes from checkpoint',()=>{const s=store();const e={id:'e1',ledger:10,contractId:'C1',value:'bad'};const x={event:e,valueXdr:'bad',valueJson:null,decodeError:true,endpoint:'mock'};s.insertEvents([x],{contract:'C1',start:10,end:10,cursor:'c1'});s.insertEvents([x],{contract:'C1',start:10,end:10,cursor:'c1'});expect(s.status().events).toBe(1);expect(s.checkpoint('C1')?.cursor).toBe('c1');expect((s.events({limit:10,offset:0})[0] as any).decode_error).toBe(1);s.close()});it('records gaps and unrecoverable state',()=>{const s=store();s.addGap({contract:'C1',startLedger:1,endLedger:2,reason:'retention',status:'open'});expect(s.gaps()[0].status).toBe('open');s.db.prepare("UPDATE gaps SET status='unrecoverable' WHERE id=?").run(s.gaps()[0].id);expect(s.gaps()[0].status).toBe('unrecoverable');s.close()})});
-describe('RPC and safety',()=>{it('recognizes the out-of-range error',()=>expect(isBeforeOldest(new RpcError(-32600,'start is before oldest ledger'))).toBe(true));it('redacts tokens in URLs and bearer errors',()=>{const s=redact('https://x.test/rpc?api_key=secret Bearer abc');expect(s).not.toContain('secret');expect(s).not.toContain('abc')});it('keeps bad XDR without throwing',()=>expect(decodeScVal('not-xdr')).toMatchObject({error:true,xdr:'not-xdr'}));it('calls JSON-RPC with bounded request data',async()=>{let body:any;const c=new RpcClient({name:'m',url:'https://x.test/rpc?token=hidden',archiveCapable:false,contracts:[]},async(_u,o)=>{body=JSON.parse(String(o?.body));return new Response(JSON.stringify({result:{passphrase:'p'}}),{status:200})});await c.getNetwork();expect(body.method).toBe('getNetwork');expect(body.params).toEqual({})})});
-describe('API',()=>{it('caps pagination and rejects bad input',async()=>{const s=store();const app=createApi(s,{networkPassphrase:'p',database:'x',pollIntervalMs:1,pageLimit:1,api:{host:'127.0.0.1',port:1,cors:false},endpoints:[]});let r=await app.inject('/events?limit=1001');expect(r.statusCode).toBe(400);r=await app.inject('/events?limit=nope');expect(r.statusCode).toBe(400);await app.close();s.close()})});
+import { afterEach, describe, expect, it } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
+import { Store } from '../src/db.js';
+import { decodeScVal, decodeTopics } from '../src/decode.js';
+import { redact } from '../src/redact.js';
+import { RpcClient, RpcError, isBeforeOldest } from '../src/rpc.js';
+import { createApi } from '../src/api.js';
+const files: string[] = [];
+function store() {
+  const f = path.join(os.tmpdir(), `eventide-${Date.now()}-${Math.random()}.db`);
+  files.push(f);
+  return new Store(f);
+}
+afterEach(() => {
+  for (const f of files)
+    for (const x of [f, `${f}-wal`, `${f}-shm`])
+      try {
+        fs.rmSync(x);
+      } catch {}
+});
+const event = (id: string, ledger: number, contract = 'C1') => ({
+  id,
+  ledger,
+  contractId: contract,
+  value: 'bad',
+  topic: ['AAAADwAAAAh0cmFuc2Zlcg=='],
+});
+describe('storage and coverage', () => {
+  it('deduplicates and merges adjacent intervals transactionally', () => {
+    const s = store();
+    const x = (e: any) => ({
+      event: e,
+      valueXdr: 'bad',
+      valueJson: null,
+      topicsJson: '[]',
+      decodedTopicsJson: '[]',
+      eventName: null,
+      decodeError: true,
+      endpoint: 'mock',
+    });
+    s.insertPage([x(event('e1', 10))], {
+      contract: 'C1',
+      cursor: 'a',
+      latestLedger: 10,
+      coveredStart: 10,
+      coveredEnd: 10,
+    });
+    s.insertPage([x(event('e1', 10)), x(event('e2', 11))], {
+      contract: 'C1',
+      cursor: 'b',
+      latestLedger: 11,
+      coveredStart: 11,
+      coveredEnd: 11,
+    });
+    expect(s.status().events).toBe(2);
+    expect(s.coverage('C1')).toHaveLength(1);
+    expect(s.coverage('C1')[0].start_ledger).toBe(10);
+    expect(s.coverage('C1')[0].end_ledger).toBe(11);
+    s.close();
+  });
+  it('records and overlaps unrecovered gaps', () => {
+    const s = store();
+    s.addGap({ contract: 'C1', startLedger: 1, endLedger: 2, reason: 'retention', status: 'open' });
+    expect(s.overlaps('C1', 2, 3)).toHaveLength(1);
+    s.updateGap(s.gaps()[0].id!, 'unrecoverable');
+    expect(s.gaps()[0].status).toBe('unrecoverable');
+    s.close();
+  });
+});
+describe('decoding and transport', () => {
+  it('decodes topics and derives the event name', () => {
+    const t = decodeTopics(['AAAADwAAAAh0cmFuc2Zlcg==']);
+    expect(t.eventName).toBe('transfer');
+    expect(t.error).toBe(false);
+  });
+  it('keeps malformed XDR raw', () =>
+    expect(decodeScVal('not-xdr')).toMatchObject({ raw: 'not-xdr', error: true }));
+  it('recognizes range errors and redacts secrets', () => {
+    expect(isBeforeOldest(new RpcError(-32600, 'start is before oldest ledger'))).toBe(true);
+    expect(redact('https://x.test/rpc?api_key=secret Bearer abc')).not.toContain('secret');
+  });
+  it('handles non-json RPC responses as errors', async () => {
+    const c = new RpcClient(
+      { name: 'm', url: 'https://x.test', archiveCapable: false, contracts: [], maxRetries: 0 },
+      async () => new Response('oops', { status: 200 }),
+    );
+    await expect(c.getNetwork()).rejects.toThrow('non-JSON');
+  });
+});
+describe('api', () => {
+  it('rejects bad pagination and reports per-query completeness', async () => {
+    const s = store();
+    s.addGap({ contract: 'C1', startLedger: 10, endLedger: 20, reason: 'outage', status: 'open' });
+    const app = createApi(s, {
+      networkPassphrase: 'p',
+      database: 'x',
+      pollIntervalMs: 1,
+      pageLimit: 1,
+      retry: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 1 },
+      api: { host: '127.0.0.1', port: 1, corsOrigins: [] },
+      endpoints: [],
+    });
+    expect((await app.inject('/events?limit=1001')).statusCode).toBe(400);
+    const r = await app.inject('/events?contract=C1&from=12&to=13');
+    expect(r.statusCode).toBe(200);
+    expect(r.json().incomplete).toBe(true);
+    await app.close();
+    s.close();
+  });
+});

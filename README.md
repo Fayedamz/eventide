@@ -1,29 +1,36 @@
 # Eventide
 
-Eventide v0.1 is a TypeScript/Node.js Soroban event indexer that stores events in SQLite, tracks the ledger ranges it has covered, and records gaps instead of pretending unavailable history exists.
+[![CI](https://github.com/Fayedamz/eventide/actions/workflows/ci.yml/badge.svg)](https://github.com/Fayedamz/eventide/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Eventide is a TypeScript/Node.js Soroban event indexer that notices missing ledger ranges and repairs them when a configured archive-capable endpoint can prove the exact range is available. It stores contract events in SQLite, preserves malformed XDR, and reports incomplete history honestly.
 
 ## Quickstart
 
 ```bash
-npm install
+npm ci
 cp config.example.yaml eventide.yaml
-# edit the network passphrase, contract IDs, and endpoints
+# add valid contract IDs
 npm run build
-node dist/cli.js run eventide.yaml
-node dist/cli.js status eventide.yaml
-node dist/cli.js api eventide.yaml
+node dist/cli.js validate-config eventide.yaml
+node dist/cli.js watch eventide.yaml
 ```
 
-The default API listens on `127.0.0.1:8787`. Set `api.host` explicitly to expose it elsewhere; Eventide prints a warning when it is not loopback-only. CORS is disabled unless you add an opt-in CORS implementation in a deployment wrapper. RPC API keys are supplied through an environment variable named by `apiKeyEnv`; the secret value is never stored in YAML or logs.
+Run `node dist/cli.js api eventide.yaml` in another process. The API binds to `127.0.0.1` by default. Docker users can use `docker compose up --build` after placing a config at the mounted `/data/eventide.yaml` path.
 
 ## Commands
 
-`init [config]` creates a starter YAML configuration. `run [config]` verifies every endpoint's network passphrase and performs one polling pass. `status [config]` prints event, checkpoint, and gap status. `gaps [config]` lists open, recovered, and unrecoverable ranges. `backfill [config]` tries open gaps against endpoints explicitly marked `archiveCapable`. `query [config]` prints stored events. `api [config]` starts the read-only HTTP API.
+`init` creates a self-contained starter config. `validate-config` checks endpoint shape and contract StrKeys. `run` performs one pass; `watch` polls serially at `pollIntervalMs`; `status`, `gaps`, and `query` inspect local state; `backfill` attempts exact open ranges on archive-capable endpoints; `export` emits NDJSON or CSV; `api` starts the read-only service.
 
-The API exposes `GET /health`, `GET /status`, `GET /gaps`, and `GET /events`. `/events` accepts `contract`, `from`, `to`, `limit` (1–1000), and `offset`. SQL values are always bound parameters; no API route writes or runs backfill.
+## API
 
-## Design notes
+The API exposes `/health`, `/status`, `/gaps`, `/contracts`, `/ledgers/coverage`, `/openapi.json`, `/events/:id`, and `/events`. Event queries support contract, event name, topic, ledger range, type, transaction hash, limit, and offset filters. Responses contain parsed JSON values and topics, plus `incomplete` when the requested contract/range overlaps an unrecovered gap. Optional bearer auth, CORS allowlisting, and a simple rate limit are configurable.
 
-Events use the RPC event `id` as their primary key and are inserted with `INSERT OR IGNORE`. Event writes and checkpoint/range updates share one SQLite transaction. SQLite WAL mode is enabled. A malformed ScVal is retained as raw XDR with `decode_error=1`, while indexing continues. Shutdown handlers close the database cleanly.
+## How gap recovery works
 
-Read [docs/VERIFIED.md](docs/VERIFIED.md) for the external facts this implementation relies on and [LIMITATIONS.md](LIMITATIONS.md) for recovery and deployment limits.
+Each successful page commits events, a per-contract cursor/latest ledger checkpoint, and a coverage interval in one SQLite transaction. Adjacent or overlapping intervals merge. If an RPC retention boundary moves past a requested start, Eventide records the missing range and continues from the node's current oldest ledger. Backfill requests the gap's exact inclusive range, paginates to completion, verifies interval coverage, and only then marks the gap recovered.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md), [`docs/API.md`](docs/API.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md), [`docs/VERIFIED.md`](docs/VERIFIED.md), and [`LIMITATIONS.md`](LIMITATIONS.md).
+
+## Status
+
+Version 0.2.0 is pre-alpha and testnet-first. Reorganizations are not handled, the SQLite store is single-process, and a provider's archive capability must be explicitly verified by the operator.

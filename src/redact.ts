@@ -1,2 +1,14 @@
-export function redact(input: unknown): string { const s = input instanceof Error ? `${input.name}: ${input.message}\n${input.stack ?? ''}` : String(input); return s.replace(/(https?:\/\/[^\s/?#]+)([^\s]*)/gi, (_m, host: string, tail: string) => { const clean = tail.replace(/([?&](?:api[_-]?key|token|key|secret|auth)=)[^&\s]*/gi, '$1[REDACTED]'); return `${host}${clean}`; }).replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED]'); }
-export function safeError(e: unknown): Error { return new Error(redact(e)); }
+export function redact(value: unknown): string {
+  const s =
+    value instanceof Error
+      ? `${value.name}: ${value.message}\n${value.stack ?? ''}`
+      : String(value);
+  return s
+    .replace(
+      /(https?:\/\/[^\s/?#]+)([^\s]*)/gi,
+      (_m, h: string, t: string) =>
+        h + t.replace(/([?&](?:api[_-]?key|token|key|secret|auth)=)[^&\s]*/gi, '$1[REDACTED]'),
+    )
+    .replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED]')
+    .replace(/(api[_-]?key|token|secret)=[^\s&]+/gi, '$1=[REDACTED]');
+}

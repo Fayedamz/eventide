@@ -1,0 +1,7 @@
+networkPassphrase: "Test SDF Network ; September 2015"
+database: "./eventide-testnet.db"
+endpoints:
+  - name: testnet
+    url: "https://soroban-testnet.stellar.org"
+    archiveCapable: false
+    contracts: []
